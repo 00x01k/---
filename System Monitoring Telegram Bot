@@ -1,0 +1,302 @@
+import logging
+import asyncio
+import subprocess
+import os
+import psutil
+import re
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+
+# Включаем логирование
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Пороговые значения
+CPU_TEMP_THRESHOLD = 70.0  # Температура CPU в градусах Цельсия
+GPU_TEMP_THRESHOLD = 80.0  # Температура GPU в градусах Цельсия
+CPU_USAGE_THRESHOLD = 90.0 # Нагрузка на CPU в процентах
+MEMORY_USAGE_THRESHOLD = 90.0 # Нагрузка на память в процентах
+
+# Переменная для хранения идентификатора текстового окна
+fullscreen_text_pid = None
+
+# Проверка прав sudo перед запуском скрипта
+def check_sudo():
+    if os.geteuid() != 0:
+        print("This script requires root privileges. Please run it with sudo.")
+        exit(1)
+
+# Функция для получения температуры CPU
+def get_cpu_temperature():
+    try:
+        result = subprocess.run(['sensors'], stdout=subprocess.PIPE, text=True)
+        output = result.stdout
+
+        core_temps = re.findall(r'Core \d+:\s+(\+[\d.]+)°C', output)
+        if core_temps:
+            return [float(temp) for temp in core_temps]
+        
+        package_temp = re.search(r'Package id 0:\s+(\+[\d.]+)°C', output)
+        if package_temp:
+            return [float(package_temp.group(1))]
+        
+        return []
+    except Exception as e:
+        logger.error(f"Error retrieving CPU temperature: {e}")
+        return []
+
+# Функция для получения температуры GPU
+def get_gpu_temperature():
+    try:
+        result = subprocess.run(['nvidia-smi', '--query-gpu=temperature.gpu', '--format=csv,noheader,nounits'], stdout=subprocess.PIPE, text=True)
+        temp = result.stdout.strip()
+        return float(temp) if temp else None
+    except Exception as e:
+        logger.error(f"Error retrieving GPU temperature: {e}")
+        return None
+
+# Функция для получения нагрузки на CPU и память
+def get_cpu_memory_usage():
+    usage = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    return usage, memory.percent
+
+# Функция для получения состояния дисплея
+def get_display_status():
+    try:
+        result = subprocess.run(['xset', 'q'], stdout=subprocess.PIPE, text=True)
+        output = result.stdout
+        
+        # Состояние дисплея
+        display_on = "Monitor is On" if "Monitor is On" in output else "Monitor is Off"
+        
+        # Проверка времени до отключения
+        timeout_match = re.search(r"Standby:\s+(\d+)\s+Suspend:\s+(\d+)\s+Off:\s+(\d+)", output)
+        if timeout_match:
+            time_until_off = f"{timeout_match.group(3)} seconds"
+        else:
+            time_until_off = "N/A"
+        
+        # Проверка паролей
+        result_password = subprocess.run(['loginctl', 'show-user', os.getlogin(), '--property=IdleHint'], stdout=subprocess.PIPE, text=True)
+        password_required = "Password Required" if "yes" in result_password.stdout.lower() else "Password Not Required"
+        
+        return display_on, time_until_off, password_required
+    except Exception as e:
+        logger.error(f"Error retrieving display status: {e}")
+        return "Error", "Error", "Error"
+
+# Функция для включения дисплея
+def turn_on_display():
+    try:
+        subprocess.run(['xset', 'dpms', 'force', 'on'])
+    except Exception as e:
+        logger.error(f"Error turning on display: {e}")
+
+# Функция для отключения дисплея
+def turn_off_display():
+    try:
+        subprocess.run(['xset', 'dpms', 'force', 'off'])
+    except Exception as e:
+        logger.error(f"Error turning off display: {e}")
+
+# Функция для выключения системы
+def shutdown_system():
+    try:
+        subprocess.run(['shutdown', '-h', 'now'])
+    except Exception as e:
+        logger.error(f"Error shutting down system: {e}")
+
+# Функция для блокировки экрана
+def lock_screen():
+    try:
+        subprocess.run(['loginctl', 'lock-session'])
+    except Exception as e:
+        logger.error(f"Error locking screen: {e}")
+
+# Функция для отображения текста на весь экран
+def show_fullscreen_text(text):
+    global fullscreen_text_pid
+    try:
+        # Закрыть текущее текстовое окно, если оно есть
+        if fullscreen_text_pid:
+            subprocess.run(['kill', str(fullscreen_text_pid)], check=True)
+        
+        # Используем zenity для отображения текста на весь экран
+        process = subprocess.Popen(['zenity', '--info', '--text', text, '--width=800', '--height=600', '--title=Fullscreen Text'], stdout=subprocess.PIPE, text=True)
+        fullscreen_text_pid = process.pid
+    except Exception as e:
+        logger.error(f"Error displaying fullscreen text: {e}")
+
+# Функция для выполнения команды и отправки результата
+async def execute_command(command: str) -> str:
+    try:
+        result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return result.stdout if result.stdout else result.stderr
+    except Exception as e:
+        return f"Error executing command: {e}"
+
+# Функция для закрытия Firefox
+def close_firefox():
+    try:
+        subprocess.run(['pkill', 'firefox'])
+    except Exception as e:
+        logger.error(f"Error closing Firefox: {e}")
+
+# Функция для отправки уведомлений
+async def send_alert(context: ContextTypes.DEFAULT_TYPE, message: str):
+    chat_id = context.job.chat_id
+    await context.bot.send_message(chat_id=chat_id, text=message)
+
+# Функция для проверки и отправки уведомлений
+async def check_status(context: ContextTypes.DEFAULT_TYPE) -> None:
+    usage, memory_usage = get_cpu_memory_usage()
+    cpu_temps = get_cpu_temperature()
+    gpu_temp = get_gpu_temperature()
+
+    alerts = []
+
+    if any(temp > CPU_TEMP_THRESHOLD for temp in cpu_temps):
+        alerts.append(f"CPU temperature exceeded threshold: {', '.join(map(str, cpu_temps))}°C")
+    
+    if gpu_temp is not None and gpu_temp > GPU_TEMP_THRESHOLD:
+        alerts.append(f"GPU temperature exceeded threshold: {gpu_temp}°C")
+    
+    if usage > CPU_USAGE_THRESHOLD:
+        alerts.append(f"CPU usage exceeded threshold: {usage}%")
+    
+    if memory_usage > MEMORY_USAGE_THRESHOLD:
+        alerts.append(f"Memory usage exceeded threshold: {memory_usage}%")
+    
+    if alerts:
+        for alert in alerts:
+            await send_alert(context, alert)
+
+# Функция для отображения меню
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [InlineKeyboardButton("Мониторинг CPU и памяти", callback_data='cpu_mem')],
+        [InlineKeyboardButton("Проверка свободного места на диске", callback_data='disk_space')],
+        [InlineKeyboardButton("Температуры", callback_data='temperature')],
+        [InlineKeyboardButton("Отключить дисплей", callback_data='turn_off_display')],
+        [InlineKeyboardButton("Включить дисплей", callback_data='turn_on_display')],
+        [InlineKeyboardButton("Вывести текст на экран", callback_data='fullscreen_text')],
+        [InlineKeyboardButton("Выключить систему", callback_data='shutdown')],
+        [InlineKeyboardButton("Заблокировать экран", callback_data='lock_screen')],
+        [InlineKeyboardButton("Выполнить команду", callback_data='execute_command')],
+        [InlineKeyboardButton("Закрыть Firefox", callback_data='close_firefox')],
+    ]
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Проверка, какой тип update используется
+    if update.message:
+        await update.message.reply_text('Выберите действие:', reply_markup=reply_markup)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text('Выберите действие:', reply_markup=reply_markup)
+
+# Функция для запуска бота
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Получаем информацию о состоянии дисплея и паролях
+    display_on, time_until_off, password_required = get_display_status()
+    
+    # Отправляем информацию о состоянии дисплея
+    info_message = (f"Display status: {display_on}\n"
+                    f"Time until display off: {time_until_off}\n"
+                    f"Password required on screen lock: {password_required}")
+    await update.message.reply_text(info_message)
+    
+    # Отображаем меню
+    await show_menu(update, context)
+
+# Обработка нажатий кнопок
+async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    response = ""
+
+    if query.data == 'cpu_mem':
+        usage, memory_usage = get_cpu_memory_usage()
+        cpu_temps = get_cpu_temperature()
+        gpu_temp = get_gpu_temperature()
+
+        cpu_temp_str = ', '.join([f"{temp}°C" for temp in cpu_temps]) if cpu_temps else "N/A"
+        gpu_temp_str = f"{gpu_temp}°C" if gpu_temp is not None else "N/A"
+        response = f"CPU: {cpu_temp_str}\nGPU: {gpu_temp_str}\nCPU Usage: {usage}%\nMemory Usage: {memory_usage}%"
+    elif query.data == 'disk_space':
+        response = "Disk space check functionality is not implemented."
+    elif query.data == 'temperature':
+        cpu_temps = get_cpu_temperature()
+        gpu_temp = get_gpu_temperature()
+        cpu_temp_str = ', '.join([f"{temp}°C" for temp in cpu_temps]) if cpu_temps else "N/A"
+        gpu_temp_str = f"{gpu_temp}°C" if gpu_temp is not None else "N/A"
+        response = f"CPU: {cpu_temp_str}\nGPU: {gpu_temp_str}"
+    elif query.data == 'turn_off_display':
+        turn_off_display()
+        response = "Display turned off."
+    elif query.data == 'turn_on_display':
+        turn_on_display()
+        response = "Display turned on."
+    elif query.data == 'shutdown':
+        shutdown_system()
+        response = "System is shutting down."
+    elif query.data == 'lock_screen':
+        lock_screen()
+        response = "Screen locked."
+    elif query.data == 'fullscreen_text':
+        response = "Please send the text to display on the screen."
+        context.user_data['awaiting_text'] = True
+    elif query.data == 'execute_command':
+        response = "Please send the command to execute."
+        context.user_data['awaiting_command'] = True
+    elif query.data == 'close_firefox':
+        close_firefox()
+        response = "Firefox has been closed."
+    else:
+        response = "Invalid option."
+
+    await query.edit_message_text(text=response)
+    # Ждем 2 секунды и снова отображаем меню
+    await asyncio.sleep(2)
+    await show_menu(update, context)
+
+# Функция для обработки текстовых сообщений
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.get('awaiting_text'):
+        text = update.message.text.upper()
+        show_fullscreen_text(text)
+        context.user_data['awaiting_text'] = False
+        await update.message.reply_text("Текст отображается на весь экран.")
+        # Закрываем текстовое окно при выборе нового пункта меню
+        await asyncio.sleep(2)
+        await show_menu(update, context)
+    elif context.user_data.get('awaiting_command'):
+        command = update.message.text
+        result = await execute_command(command)
+        await update.message.reply_text(f"Command output:\n{result}")
+        context.user_data['awaiting_command'] = False
+        # Закрываем командное окно при выборе нового пункта меню
+        await asyncio.sleep(2)
+        await show_menu(update, context)
+    else:
+        await update.message.reply_text("Please use the menu options.")
+
+# Основная функция
+def main() -> None:
+    check_sudo()  # Проверяем права sudo
+    
+    application = Application.builder().token("########").build()
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CallbackQueryHandler(button))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    # Инициализируем и запускаем job_queue
+    job_queue = application.job_queue
+    job_queue.run_repeating(check_status, interval=60, first=0)
+    
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
